@@ -135,23 +135,22 @@ def configure_windows_arm64_vcpkg_env(target):
         sys.exit(-1)
 
     triplet_root = installed_root / 'arm64-windows-static'
-    source_include = triplet_root / 'include' / 'opus'
-    source_lib = triplet_root / 'lib' / 'opus.lib'
+    source_include = triplet_root / 'include'
+    source_lib = triplet_root / 'lib'
     missing = [p for p in (source_include, source_lib) if not p.exists()]
     if missing:
-        sys.stderr.write('Missing Windows arm64 opus files:\n')
+        sys.stderr.write('Missing Windows arm64 vcpkg triplet files:\n')
         for path in missing:
             sys.stderr.write(f'  {path}\n')
-        sys.stderr.write('Install opus with vcpkg for triplet arm64-windows-static.\n')
+        sys.stderr.write('Install the arm64-windows-static triplet with vcpkg.\n')
         sys.exit(-1)
 
     compat_root = Path('target') / 'vcpkg-arm64-magnum-opus'
     compat_triplet = compat_root / 'installed' / 'x64-windows-static'
-    compat_include = compat_triplet / 'include' / 'opus'
-    compat_lib = compat_triplet / 'lib'
-    compat_lib.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_include, compat_include, dirs_exist_ok=True)
-    shutil.copy2(source_lib, compat_lib / 'opus.lib')
+    shutil.rmtree(compat_root, ignore_errors=True)
+    (compat_triplet / 'include').mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_include, compat_triplet / 'include', dirs_exist_ok=True)
+    shutil.copytree(source_lib, compat_triplet / 'lib', dirs_exist_ok=True)
 
     previous = {
         'VCPKG_ROOT': os.environ.get('VCPKG_ROOT'),
