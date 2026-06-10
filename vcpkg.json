@@ -49,6 +49,11 @@
       "host": false
     },
     {
+      "name": "libsodium",
+      "host": false,
+      "platform": "(windows & arm64 & static)"
+    },
+    {
       "name": "mfx-dispatch",
       "host": true,
       "platform": "((x86 | x64) & ((android | linux) | (windows & !uwp)))"
@@ -80,7 +85,21 @@
     {
       "name": "ffmpeg",
       "host": false,
-      "platform": "((android | ios | (linux & arm32)) & static)"
+      "features": [
+        {
+          "name": "amf",
+          "platform": "(((windows & !arm64) | linux) & static)"
+        },
+        {
+          "name": "nvcodec",
+          "platform": "(((windows & !arm64) | linux) & static)"
+        },
+        {
+          "name": "qsv",
+          "platform": "(windows & static & (x86 | x64))"
+        }
+      ],
+      "platform": "((android | ios | windows | osx | (linux & arm32)) & static)"
     }
   ],
   "vcpkg-configuration": {

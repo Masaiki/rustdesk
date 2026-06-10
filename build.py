@@ -38,6 +38,14 @@ def rust_exe_path(target):
     return f'{rust_release_dir(target)}/{hbb_name}'
 
 
+def macos_flutter_arch(target):
+    if target == 'aarch64-apple-darwin':
+        return 'arm64'
+    if target == 'x86_64-apple-darwin':
+        return 'x64'
+    return ''
+
+
 def windows_flutter_target_platform(target):
     if target == 'aarch64-pc-windows-msvc':
         return 'windows-arm64'
@@ -530,17 +538,22 @@ def build_deb_from_folder(version, binary_folder):
     os.chdir("..")
 
 
-def build_flutter_dmg(version, features):
+def build_flutter_dmg(version, features, target):
     if not skip_cargo:
         # set minimum osx build target, now is 10.14, which is the same as the flutter xcode project
         system2(
-            f'MACOSX_DEPLOYMENT_TARGET=10.14 cargo build --locked --features {features} --release')
+            f'MACOSX_DEPLOYMENT_TARGET=10.14 cargo build --locked --features {features} --release{rust_target_args(target)}')
     # copy dylib
-    system2(
-        "cp target/release/liblibrustdesk.dylib target/release/librustdesk.dylib")
+    release_dir = rust_release_dir(target)
+    if target:
+        Path('target/release').mkdir(parents=True, exist_ok=True)
+        system2(f'cp {release_dir}/liblibrustdesk.dylib target/release/liblibrustdesk.dylib')
+    system2(f'cp {release_dir}/liblibrustdesk.dylib {release_dir}/librustdesk.dylib')
     os.chdir('flutter')
-    system2('flutter build macos --release')
-    system2('cp -rf ../target/release/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/')
+    target_arch = macos_flutter_arch(target)
+    flutter_arch_args = f' --target-platform darwin-{target_arch}' if target_arch else ''
+    system2(f'flutter build macos --release{flutter_arch_args}')
+    system2(f'cp -rf ../{release_dir}/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/')
     '''
     system2(
         "create-dmg --volname \"RustDesk Installer\" --window-pos 200 120 --window-size 800 400 --icon-size 100 --app-drop-link 600 185 --icon RustDesk.app 200 190 --hide-extension RustDesk.app rustdesk.dmg ./build/macos/Build/Products/Release/RustDesk.app")
@@ -695,7 +708,7 @@ def main():
     else:
         if flutter:
             if osx:
-                build_flutter_dmg(version, features)
+                build_flutter_dmg(version, features, args.target)
                 pass
             else:
                 # system2(
