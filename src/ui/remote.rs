@@ -182,7 +182,13 @@ impl InvokeUiSession for SciterHandler {
                 status
                     .codec_format
                     .map_or(Value::null(), |it| it.to_string().into()),
-                status.chroma.map_or(Value::null(), |it| it.into())
+                status.chroma.map_or(Value::null(), |it| it.into()),
+                status
+                    .encoding_runtime_status
+                    .map_or(Value::null(), |it| codec_runtime_status_label(it).into()),
+                status
+                    .decoding_runtime_status
+                    .map_or(Value::null(), |it| codec_runtime_status_label(it).into())
             ),
         );
     }

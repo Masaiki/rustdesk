@@ -38,7 +38,7 @@ fn link_vcpkg(mut path: PathBuf, name: &str) -> PathBuf {
     } else {
         target_arch = "arm".to_owned();
     }
-    let mut target = if target_os == "macos" {
+    let target = if target_os == "macos" {
         if target_arch == "x64" {
             "x64-osx".to_owned()
         } else if target_arch == "arm64" {
@@ -47,13 +47,16 @@ fn link_vcpkg(mut path: PathBuf, name: &str) -> PathBuf {
             format!("{}-{}", target_arch, target_os)
         }
     } else if target_os == "windows" {
-        "x64-windows-static".to_owned()
+        match target_arch.as_str() {
+            "x64" => "x64-windows-static".to_owned(),
+            "x86" => "x86-windows-static".to_owned(),
+            "arm64" => "arm64-windows-static".to_owned(),
+            "arm" => "arm-windows-static".to_owned(),
+            _ => format!("{}-windows-static", target_arch),
+        }
     } else {
         format!("{}-{}", target_arch, target_os)
     };
-    if target_arch == "x86" {
-        target = target.replace("x64", "x86");
-    }
     println!("cargo:info={}", target);
     if let Ok(vcpkg_root) = std::env::var("VCPKG_INSTALLED_ROOT") {
         path = vcpkg_root.into();

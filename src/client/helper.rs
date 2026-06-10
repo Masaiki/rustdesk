@@ -1,6 +1,6 @@
 use hbb_common::{
     get_time,
-    message_proto::{Message, VoiceCallRequest, VoiceCallResponse},
+    message_proto::{CodecRuntimeStatus, Message, VoiceCallRequest, VoiceCallResponse},
 };
 use scrap::CodecFormat;
 use std::collections::HashMap;
@@ -13,6 +13,44 @@ pub struct QualityStatus {
     pub target_bitrate: Option<i32>,
     pub codec_format: Option<CodecFormat>,
     pub chroma: Option<String>,
+    pub encoding_runtime_status: Option<CodecRuntimeStatus>,
+    pub decoding_runtime_status: Option<CodecRuntimeStatus>,
+}
+
+pub fn codec_runtime_status_label(status: CodecRuntimeStatus) -> &'static str {
+    match status {
+        CodecRuntimeStatus::CodecRuntimeSoftware => "No",
+        CodecRuntimeStatus::CodecRuntimeHardware => "Yes",
+        CodecRuntimeStatus::CodecRuntimeMixed => "Mixed",
+        CodecRuntimeStatus::CodecRuntimeUnknown => "-",
+    }
+}
+
+pub fn codec_runtime_status_from_iter<I>(statuses: I) -> CodecRuntimeStatus
+where
+    I: IntoIterator<Item = CodecRuntimeStatus>,
+{
+    let mut has_hardware = false;
+    let mut has_software = false;
+
+    for status in statuses {
+        match status {
+            CodecRuntimeStatus::CodecRuntimeHardware => has_hardware = true,
+            CodecRuntimeStatus::CodecRuntimeSoftware => has_software = true,
+            CodecRuntimeStatus::CodecRuntimeMixed => {
+                has_hardware = true;
+                has_software = true;
+            }
+            CodecRuntimeStatus::CodecRuntimeUnknown => {}
+        }
+    }
+
+    match (has_hardware, has_software) {
+        (true, true) => CodecRuntimeStatus::CodecRuntimeMixed,
+        (true, false) => CodecRuntimeStatus::CodecRuntimeHardware,
+        (false, true) => CodecRuntimeStatus::CodecRuntimeSoftware,
+        _ => CodecRuntimeStatus::CodecRuntimeUnknown,
+    }
 }
 
 #[inline]

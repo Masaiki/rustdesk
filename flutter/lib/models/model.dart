@@ -3477,6 +3477,8 @@ class QualityMonitorData {
   String? targetBitrate;
   String? codecFormat;
   String? chroma;
+  String? encodingRuntimeStatus;
+  String? decodingRuntimeStatus;
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -3538,6 +3540,14 @@ class QualityMonitorModel with ChangeNotifier {
       }
       if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
         _data.chroma = evt['chroma'];
+      }
+      if (evt.containsKey('encoding_runtime_status') &&
+          (evt['encoding_runtime_status'] as String).isNotEmpty) {
+        _data.encodingRuntimeStatus = evt['encoding_runtime_status'];
+      }
+      if (evt.containsKey('decoding_runtime_status') &&
+          (evt['decoding_runtime_status'] as String).isNotEmpty) {
+        _data.decodingRuntimeStatus = evt['decoding_runtime_status'];
       }
       notifyListeners();
     } catch (e) {

@@ -2828,6 +2828,7 @@ pub fn start_video_thread<F, T>(
     video_queue: Arc<RwLock<ArrayQueue<VideoFrame>>>,
     fps: Arc<RwLock<Option<usize>>>,
     chroma: Arc<RwLock<Option<Chroma>>>,
+    decoding_runtime_status: Arc<RwLock<HashMap<usize, CodecRuntimeStatus>>>,
     discard_queue: Arc<RwLock<bool>>,
     video_callback: F,
 ) where
@@ -2901,6 +2902,10 @@ pub fn start_video_thread<F, T>(
                                         last_chroma = tmp_chroma;
                                         *chroma.write().unwrap() = tmp_chroma;
                                     }
+                                    decoding_runtime_status
+                                        .write()
+                                        .unwrap()
+                                        .insert(display, handler.decoder.runtime_status());
 
                                     // fps calculation
                                     fps_calculate(
@@ -2956,6 +2961,10 @@ pub fn start_video_thread<F, T>(
                         if let Some(handler) = video_handler.as_mut() {
                             handler.reset(None);
                         }
+                        decoding_runtime_status
+                            .write()
+                            .unwrap()
+                            .insert(display, CodecRuntimeStatus::CodecRuntimeUnknown);
                     }
                     MediaData::RecordScreen(start) => {
                         let id = session.lc.read().unwrap().id.clone();
@@ -2969,6 +2978,7 @@ pub fn start_video_thread<F, T>(
                 break;
             }
         }
+        decoding_runtime_status.write().unwrap().remove(&display);
         log::info!("Video decoder loop exits");
     });
 }

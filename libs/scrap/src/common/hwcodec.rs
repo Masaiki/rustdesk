@@ -1,5 +1,8 @@
 use crate::{
-    codec::{base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg},
+    codec::{
+        base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg,
+        ENCODE_PENDING,
+    },
     convert::*,
     CodecFormat, EncodeInput, ImageFormat, ImageRgb, Pixfmt, HW_STRIDE_ALIGN,
 };
@@ -11,6 +14,8 @@ use hbb_common::{
     serde_derive::{Deserialize, Serialize},
     serde_json, ResultType,
 };
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+use hwcodec::ffmpeg_ram::Priority;
 use hwcodec::{
     common::{
         DataFormat, HwcodecErrno,
@@ -24,14 +29,280 @@ use hwcodec::{
         ffmpeg_linesize_offset_length, CodecInfo,
     },
 };
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+use windows::{
+    core::{GUID, PWSTR},
+    Win32::{
+        Foundation::RPC_E_CHANGED_MODE,
+        Media::MediaFoundation::{
+            IMFActivate, MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx,
+            MFT_FRIENDLY_NAME_Attribute, MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264,
+            MFVideoFormat_HEVC, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+            MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE, MFT_REGISTER_TYPE_INFO, MF_VERSION,
+        },
+        System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED},
+    },
+};
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+const MEDIA_FOUNDATION_TEST_TIMEOUT_MS: u128 = 3_000;
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+const MEDIA_FOUNDATION_TEST_MAX_FRAMES: usize = 90;
 
 crate::generate_call_macro!(call_yuv, false);
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+struct AvLogLevelGuard {
+    previous: i32,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl AvLogLevelGuard {
+    fn verbose() -> Self {
+        unsafe {
+            hwcodec::ffmpeg::hwcodec_set_av_log_callback();
+            let previous = hwcodec::ffmpeg::av_log_get_level();
+            if previous < hwcodec::ffmpeg::AV_LOG_VERBOSE as i32 {
+                hwcodec::ffmpeg::av_log_set_level(hwcodec::ffmpeg::AV_LOG_VERBOSE as i32);
+            }
+            Self { previous }
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl Drop for AvLogLevelGuard {
+    fn drop(&mut self) {
+        unsafe {
+            hwcodec::ffmpeg::av_log_set_level(self.previous);
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+struct ComInitGuard {
+    uninitialize: bool,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl ComInitGuard {
+    fn new() -> Result<Self, windows::core::HRESULT> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() {
+            Ok(Self { uninitialize: true })
+        } else if hr == RPC_E_CHANGED_MODE {
+            log::debug!("COM is already initialized with a different apartment model");
+            Ok(Self {
+                uninitialize: false,
+            })
+        } else {
+            Err(hr)
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl Drop for ComInitGuard {
+    fn drop(&mut self) {
+        if self.uninitialize {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+struct MfStartupGuard;
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl MfStartupGuard {
+    fn new() -> windows::core::Result<Self> {
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }?;
+        Ok(Self)
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+impl Drop for MfStartupGuard {
+    fn drop(&mut self) {
+        if let Err(err) = unsafe { MFShutdown() } {
+            log::debug!("MFShutdown failed after encoder MFT enumeration: {err:?}");
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn guid_to_string(guid: &GUID) -> String {
+    format!("{guid:?}").to_ascii_lowercase()
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn get_mft_string(activate: &IMFActivate, key: &GUID) -> Option<String> {
+    let mut value = PWSTR::null();
+    let mut len = 0;
+    let result = unsafe { activate.GetAllocatedString(key, &mut value, &mut len) };
+    if let Err(err) = result {
+        log::debug!("failed to read Media Foundation MFT string attribute: {err:?}");
+        return None;
+    }
+    if value.is_null() {
+        return None;
+    }
+    let string = unsafe { value.to_string().ok() };
+    unsafe {
+        CoTaskMemFree(Some(value.as_ptr().cast()));
+    }
+    string
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn get_mft_guid(activate: &IMFActivate, key: &GUID) -> Option<GUID> {
+    match unsafe { activate.GetGUID(key) } {
+        Ok(guid) => Some(guid),
+        Err(err) => {
+            log::debug!("failed to read Media Foundation MFT GUID attribute: {err:?}");
+            None
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn enumerate_media_foundation_encoder_mfts(
+    label: &str,
+    subtype: GUID,
+    flags_label: &str,
+    flags: MFT_ENUM_FLAG,
+) {
+    let output_type = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: subtype,
+    };
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0;
+    let result = unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(&output_type),
+            &mut activates,
+            &mut count,
+        )
+    };
+    if let Err(err) = result {
+        log::warn!(
+            "Media Foundation {label} encoder MFT enumeration ({flags_label}) failed: {:?} (HRESULT=0x{:08X})",
+            err,
+            err.code().0 as u32
+        );
+        return;
+    }
+
+    log::info!("Media Foundation {label} encoder MFT count ({flags_label}): {count}");
+    if activates.is_null() {
+        return;
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts_mut(activates, count as usize) };
+    for (idx, activate) in slice.iter_mut().enumerate() {
+        if let Some(activate) = activate.as_ref() {
+            let name = get_mft_string(activate, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let clsid = get_mft_guid(activate, &MFT_TRANSFORM_CLSID_Attribute)
+                .map(|guid| guid_to_string(&guid))
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            log::info!(
+                "Media Foundation {label} encoder MFT ({flags_label}) #{}: name=\"{}\", clsid={}",
+                idx + 1,
+                name,
+                clsid
+            );
+        }
+        *activate = None;
+    }
+
+    unsafe {
+        CoTaskMemFree(Some(activates.cast()));
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn log_media_foundation_encoder_mfts() {
+    let com_guard = match ComInitGuard::new() {
+        Ok(guard) => guard,
+        Err(hr) => {
+            log::warn!(
+                "Media Foundation encoder MFT enumeration skipped: CoInitializeEx failed with HRESULT=0x{:08X}",
+                hr.0 as u32
+            );
+            return;
+        }
+    };
+    let mf_guard = match MfStartupGuard::new() {
+        Ok(guard) => guard,
+        Err(err) => {
+            log::warn!(
+                "Media Foundation encoder MFT enumeration skipped: MFStartup failed: {:?} (HRESULT=0x{:08X})",
+                err,
+                err.code().0 as u32
+            );
+            drop(com_guard);
+            return;
+        }
+    };
+
+    for (label, subtype) in [("H264", MFVideoFormat_H264), ("H265", MFVideoFormat_HEVC)] {
+        enumerate_media_foundation_encoder_mfts(label, subtype, "all", MFT_ENUM_FLAG_ALL);
+        enumerate_media_foundation_encoder_mfts(label, subtype, "hardware", MFT_ENUM_FLAG_HARDWARE);
+    }
+
+    drop(mf_guard);
+    drop(com_guard);
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn media_foundation_dummy_yuv(ctx: &EncodeContext) -> Option<Vec<u8>> {
+    let Ok((linesize, offset, len)) =
+        ffmpeg_linesize_offset_length(ctx.pixfmt, ctx.width as _, ctx.height as _, ctx.align as _)
+    else {
+        log::warn!("Media Foundation encoder test cannot run: failed to generate dummy YUV data");
+        return None;
+    };
+    if len <= 0 {
+        log::warn!("Media Foundation encoder test cannot run: invalid dummy YUV size {len}");
+        return None;
+    }
+
+    let mut yuv = vec![0; len as usize];
+    if ctx.pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 && linesize.len() > 1 && !offset.is_empty() {
+        let y_stride = linesize[0].max(0) as usize;
+        let uv_stride = linesize[1].max(0) as usize;
+        let uv_offset = offset[0].max(0) as usize;
+        let width = ctx.width.max(0) as usize;
+        let height = ctx.height.max(0) as usize;
+        for row in 0..height {
+            let start = row * y_stride;
+            let end = start + width.min(y_stride);
+            if end <= yuv.len() {
+                yuv[start..end].fill(16);
+            }
+        }
+        for row in 0..(height / 2) {
+            let start = uv_offset + row * uv_stride;
+            let end = start + width.min(uv_stride);
+            if end <= yuv.len() {
+                yuv[start..end].fill(128);
+            }
+        }
+    }
+    Some(yuv)
+}
 
 #[cfg(not(target_os = "android"))]
 lazy_static::lazy_static! {
@@ -133,6 +404,8 @@ impl EncoderApi for HwRamEncoder {
                 _ => bail!("unsupported format: {:?}", self.format),
             }
             Ok(vf)
+        } else if self.config.name.contains("_mf") {
+            Err(anyhow!(ENCODE_PENDING))
         } else {
             Err(anyhow!("no valid frame"))
         }
@@ -195,7 +468,7 @@ impl EncoderApi for HwRamEncoder {
     }
 
     fn latency_free(&self) -> bool {
-        ["mediacodec", "videotoolbox"]
+        ["_mf", "mediacodec", "videotoolbox"]
             .iter()
             .all(|&x| !self.config.name.contains(x))
     }
@@ -236,7 +509,15 @@ impl HwRamEncoder {
                 data.append(v);
                 Ok(data)
             }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Err(err) => {
+                log::debug!(
+                    "HW RAM encoder {} has no output for pts {} yet, native result: {}",
+                    self.config.name,
+                    ms,
+                    err
+                );
+                Ok(Vec::<EncodeFrame>::new())
+            }
         }
     }
 
@@ -677,6 +958,114 @@ impl HwCodecConfig {
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn available_ram_encoders(ctx: EncodeContext, _vram_string: String) -> Vec<CodecInfo> {
+    let candidates = [("h264_mf", DataFormat::H264), ("hevc_mf", DataFormat::H265)];
+    let mut available = Vec::new();
+    log_media_foundation_encoder_mfts();
+    let Some(yuv) = media_foundation_dummy_yuv(&ctx) else {
+        return available;
+    };
+
+    for (name, format) in candidates {
+        let codec = CodecInfo {
+            name: name.to_owned(),
+            format,
+            priority: Priority::Best as _,
+            ..Default::default()
+        };
+        let encoder_ctx = EncodeContext {
+            name: codec.name.clone(),
+            mc_name: codec.mc_name.clone(),
+            ..ctx.clone()
+        };
+        match Encoder::new(encoder_ctx) {
+            Ok(mut encoder) => {
+                let _av_log_guard = AvLogLevelGuard::verbose();
+                let mut passed = false;
+                let mut last_reason = "test did not produce a key frame".to_owned();
+                let start = std::time::Instant::now();
+                let mut attempt = 0usize;
+                while attempt < MEDIA_FOUNDATION_TEST_MAX_FRAMES
+                    && start.elapsed().as_millis() < MEDIA_FOUNDATION_TEST_TIMEOUT_MS
+                {
+                    let pts = attempt as i64 * 33;
+                    match encoder.encode(&yuv, pts) {
+                        Ok(frames) => {
+                            let elapsed = start.elapsed().as_millis();
+                            let has_key_frame = frames.iter().any(|frame| frame.key == 1);
+                            if has_key_frame {
+                                log::debug!(
+                                    "Media Foundation encoder {} test passed on attempt {}",
+                                    codec.name,
+                                    attempt + 1
+                                );
+                                passed = true;
+                                break;
+                            }
+                            last_reason = if frames.is_empty() {
+                                format!("attempt {} produced no frames", attempt + 1)
+                            } else {
+                                format!(
+                                    "attempt {} produced {} frames but no key frame",
+                                    attempt + 1,
+                                    frames.len()
+                                )
+                            };
+                            log::debug!(
+                                "Media Foundation encoder {} test attempt {} produced {} frames in {}ms",
+                                codec.name,
+                                attempt + 1,
+                                frames.len(),
+                                elapsed
+                            );
+                        }
+                        Err(err) => {
+                            if err.to_string() == ENCODE_PENDING {
+                                last_reason =
+                                    format!("attempt {} returned pending output", attempt + 1);
+                            } else {
+                                last_reason =
+                                    format!("attempt {} returned error: {}", attempt + 1, err);
+                            }
+                            log::debug!(
+                                "Media Foundation encoder {} test attempt {} returned error: {}",
+                                codec.name,
+                                attempt + 1,
+                                err
+                            );
+                        }
+                    }
+                    attempt += 1;
+                }
+                if passed {
+                    log::info!("Media Foundation encoder {} is available", codec.name);
+                    available.push(codec);
+                } else {
+                    log::warn!(
+                        "Media Foundation encoder {} is unavailable: {}",
+                        codec.name,
+                        last_reason
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "Media Foundation encoder {} is unavailable: failed to create encoder: {:?}",
+                    codec.name,
+                    err
+                );
+            }
+        }
+    }
+    available
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+fn available_ram_encoders(ctx: EncodeContext, vram_string: String) -> Vec<CodecInfo> {
+    Encoder::available_encoders(ctx, Some(vram_string))
+}
+
 pub fn check_available_hwcodec() -> String {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     hwcodec::common::setup_parent_death_signal();
@@ -702,7 +1091,7 @@ pub fn check_available_hwcodec() -> String {
     #[cfg(not(feature = "vram"))]
     let vram_string = "".to_owned();
     let c = HwCodecConfig {
-        ram_encode: Encoder::available_encoders(ctx, Some(vram_string)),
+        ram_encode: available_ram_encoders(ctx, vram_string),
         ram_decode: Decoder::available_decoders(),
         #[cfg(feature = "vram")]
         vram_encode: vram.0,

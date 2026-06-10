@@ -31,8 +31,8 @@ use hbb_common::{
     config::{Config, PeerConfig},
     lazy_static, log,
     message_proto::{
-        supported_decoding::PreferCodec, video_frame, Chroma, CodecAbility, EncodedVideoFrames,
-        SupportedDecoding, SupportedEncoding, VideoFrame,
+        supported_decoding::PreferCodec, video_frame, Chroma, CodecAbility, CodecRuntimeStatus,
+        EncodedVideoFrames, SupportedDecoding, SupportedEncoding, VideoFrame,
     },
     sysinfo::System,
     ResultType,
@@ -46,6 +46,55 @@ lazy_static::lazy_static! {
 }
 
 pub const ENCODE_NEED_SWITCH: &'static str = "ENCODE_NEED_SWITCH";
+pub const ENCODE_PENDING: &'static str = "ENCODE_PENDING";
+
+fn h26x_encoding_detail(
+    codec: &str,
+    peer_decoders: usize,
+    peer_count: usize,
+    vram_encoding: bool,
+    hw_encoding: Option<&str>,
+) -> String {
+    if peer_count == 0 {
+        return "not usable: no connected peers".to_owned();
+    }
+    if peer_decoders < peer_count {
+        return format!("not usable: peer decoding support {peer_decoders}/{peer_count}");
+    }
+    if vram_encoding {
+        return "usable: VRAM encoder available".to_owned();
+    }
+    if let Some(name) = hw_encoding {
+        return format!("usable: HW RAM encoder {name}");
+    }
+
+    let mut reasons = Vec::new();
+    #[cfg(feature = "hwcodec")]
+    {
+        if enable_hwcodec_option() {
+            reasons.push(format!("no HW RAM {codec} encoder available"));
+        } else {
+            reasons.push("hardware codec option disabled".to_owned());
+        }
+    }
+    #[cfg(not(feature = "hwcodec"))]
+    {
+        reasons.push("built without hwcodec feature".to_owned());
+    }
+    #[cfg(feature = "vram")]
+    {
+        if enable_vram_option(true) {
+            reasons.push(format!("no VRAM {codec} encoder available"));
+        } else {
+            reasons.push("VRAM encoder option unavailable or disabled".to_owned());
+        }
+    }
+    #[cfg(not(feature = "vram"))]
+    {
+        reasons.push("built without vram feature".to_owned());
+    }
+    format!("not usable: {}", reasons.join(", "))
+}
 
 #[derive(Debug, Clone)]
 pub enum EncoderCfg {
@@ -190,14 +239,14 @@ impl Encoder {
             EncodingUpdate::Check => {}
         }
 
-        let vp8_useable = decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_vp8 > 0);
-        let av1_useable = decodings.len() > 0
-            && decodings.iter().all(|(_, s)| s.ability_av1 > 0)
-            && !disable_av1();
-        let _all_support_h264_decoding =
-            decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h264 > 0);
-        let _all_support_h265_decoding =
-            decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h265 > 0);
+        let peer_count = decodings.len();
+        let vp8_useable = peer_count > 0 && decodings.iter().all(|(_, s)| s.ability_vp8 > 0);
+        let av1_useable =
+            peer_count > 0 && decodings.iter().all(|(_, s)| s.ability_av1 > 0) && !disable_av1();
+        let h264_peer_decoders = decodings.iter().filter(|(_, s)| s.ability_h264 > 0).count();
+        let h265_peer_decoders = decodings.iter().filter(|(_, s)| s.ability_h265 > 0).count();
+        let _all_support_h264_decoding = peer_count > 0 && h264_peer_decoders == peer_count;
+        let _all_support_h265_decoding = peer_count > 0 && h265_peer_decoders == peer_count;
         #[allow(unused_mut)]
         let mut h264vram_encoding = false;
         #[allow(unused_mut)]
@@ -310,13 +359,30 @@ impl Encoder {
             }
             PreferCodec::Auto => auto_codec,
         };
-        if decodings.len() > 0 {
+        if peer_count > 0 {
             log::info!(
                 "usable: vp8={vp8_useable}, av1={av1_useable}, h264={h264_useable}, h265={h265_useable}",
             );
             log::info!(
+                "H264 encoding detail: {}; H265 encoding detail: {}",
+                h26x_encoding_detail(
+                    "H264",
+                    h264_peer_decoders,
+                    peer_count,
+                    h264vram_encoding,
+                    h264hw_encoding.as_deref()
+                ),
+                h26x_encoding_detail(
+                    "H265",
+                    h265_peer_decoders,
+                    peer_count,
+                    h265vram_encoding,
+                    h265hw_encoding.as_deref()
+                )
+            );
+            log::info!(
                 "connection count: {}, used preference: {:?}, encoder: {:?}",
-                decodings.len(),
+                peer_count,
                 preference,
                 *format
             )
@@ -625,6 +691,31 @@ impl Decoder {
 
     pub fn valid(&self) -> bool {
         self.valid
+    }
+
+    pub fn runtime_status(&self) -> CodecRuntimeStatus {
+        if !self.valid {
+            return CodecRuntimeStatus::CodecRuntimeUnknown;
+        }
+        #[cfg(feature = "vram")]
+        if self.h264_vram.is_some() || self.h265_vram.is_some() {
+            return CodecRuntimeStatus::CodecRuntimeHardware;
+        }
+        #[cfg(feature = "hwcodec")]
+        {
+            let ram_decoder = self.h264_ram.as_ref().or(self.h265_ram.as_ref());
+            if let Some(decoder) = ram_decoder {
+                if decoder.info.hwdevice != hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+                    return CodecRuntimeStatus::CodecRuntimeHardware;
+                }
+                return CodecRuntimeStatus::CodecRuntimeSoftware;
+            }
+        }
+        #[cfg(feature = "mediacodec")]
+        if self.h264_media_codec.is_some() || self.h265_media_codec.is_some() {
+            return CodecRuntimeStatus::CodecRuntimeHardware;
+        }
+        CodecRuntimeStatus::CodecRuntimeSoftware
     }
 
     // rgb [in/out] fmt and stride must be set in ImageRgb

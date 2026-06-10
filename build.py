@@ -26,6 +26,121 @@ flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
 skip_cargo = False
 
 
+def rust_target_args(target):
+    return f' --target {target}' if target else ''
+
+
+def rust_release_dir(target):
+    return f'target/{target}/release' if target else 'target/release'
+
+
+def rust_exe_path(target):
+    return f'{rust_release_dir(target)}/{hbb_name}'
+
+
+def windows_flutter_target_platform(target):
+    if target == 'aarch64-pc-windows-msvc':
+        return 'windows-arm64'
+    if target == 'x86_64-pc-windows-msvc' or not target:
+        return ''
+    return ''
+
+
+def windows_flutter_build_dir(target):
+    if target == 'aarch64-pc-windows-msvc':
+        return 'build/windows/arm64/runner/Release/'
+    return 'build/windows/x64/runner/Release/'
+
+
+def cargo_path(path):
+    return Path(path).as_posix()
+
+
+def vcpkg_installed_root():
+    installed_root = os.environ.get('VCPKG_INSTALLED_ROOT')
+    if installed_root:
+        return Path(installed_root)
+    vcpkg_root = os.environ.get('VCPKG_ROOT')
+    if vcpkg_root:
+        return Path(vcpkg_root) / 'installed'
+    return None
+
+
+def write_windows_arm64_cargo_config(target):
+    if target != 'aarch64-pc-windows-msvc':
+        return ''
+
+    installed_root = vcpkg_installed_root()
+    if installed_root is None:
+        sys.stderr.write('VCPKG_ROOT or VCPKG_INSTALLED_ROOT is required for Windows arm64 builds.\n')
+        sys.exit(-1)
+
+    triplet_root = installed_root / 'arm64-windows-static'
+    lib_dir = triplet_root / 'lib'
+    include_dir = triplet_root / 'include'
+    required_libs = [lib_dir / 'opus.lib', lib_dir / 'libsodium.lib']
+    missing = [p for p in required_libs if not p.exists()]
+    if missing:
+        sys.stderr.write('Missing Windows arm64 vcpkg libraries:\n')
+        for path in missing:
+            sys.stderr.write(f'  {path}\n')
+        sys.stderr.write('Install them with vcpkg for triplet arm64-windows-static.\n')
+        sys.exit(-1)
+
+    config_dir = Path('target') / 'cargo-config'
+    rustflags = [
+        '-Ctarget-feature=+crt-static',
+        '-Clink-arg=dxguid.lib',
+        '-Clink-arg=mfuuid.lib',
+        '-Clink-arg=strmiids.lib',
+        f'-Clink-arg={cargo_path(lib_dir / "opus.lib")}',
+    ]
+    for lib in ('avcodec.lib', 'avutil.lib', 'avformat.lib'):
+        lib_path = lib_dir / lib
+        if lib_path.exists():
+            rustflags.append(f'-Clink-arg={cargo_path(lib_path)}')
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / 'windows-arm64-vcpkg.toml'
+    rustflags_toml = '\n'.join(f'    "{flag}",' for flag in rustflags)
+    config_path.write_text(f'''[target.aarch64-pc-windows-msvc]
+rustflags = [
+{rustflags_toml}
+]
+
+[target.aarch64-pc-windows-msvc.sodium]
+rustc-link-lib = ["static=libsodium"]
+rustc-link-search = ["native={cargo_path(lib_dir)}"]
+include = "{cargo_path(include_dir)}"
+lib = "{cargo_path(lib_dir)}"
+''', encoding='utf-8')
+    return str(config_path)
+
+
+def cargo_config_args(target):
+    config_path = write_windows_arm64_cargo_config(target)
+    return f' --config "{config_path}"' if config_path else ''
+
+
+def build_output_zip_path(version, target):
+    if target == 'aarch64-pc-windows-msvc':
+        return f'rustdesk-{version}-windows-arm64.zip'
+    return f'rustdesk-{version}-windows-x64.zip'
+
+
+def zip_windows_flutter_bundle(version, target):
+    output_zip = build_output_zip_path(version, target)
+    bundle_dir = Path(flutter_build_dir_2)
+    if not (bundle_dir / 'rustdesk.exe').exists():
+        sys.stderr.write(f'Cannot find {bundle_dir / "rustdesk.exe"} for zip packaging.\n')
+        sys.exit(-1)
+    if Path(output_zip).exists():
+        Path(output_zip).unlink()
+    shutil.make_archive(Path(output_zip).with_suffix('').as_posix(), 'zip', bundle_dir)
+    print(f'output location: {Path(output_zip).resolve()}')
+    return output_zip
+
+
 def get_deb_arch() -> str:
     custom_arch = os.environ.get("DEB_ARCH")
     if custom_arch is None:
@@ -134,11 +249,22 @@ def make_parser():
         action='store_true',
         help='Skip cargo build process, only flutter version + Linux supported currently'
     )
+    parser.add_argument(
+        '--target',
+        type=str,
+        default=os.environ.get('RUSTDESK_BUILD_TARGET', ''),
+        help='Rust target triple, for example aarch64-pc-windows-msvc'
+    )
     if windows:
         parser.add_argument(
             '--skip-portable-pack',
             action='store_true',
             help='Skip packing, only flutter version + Windows supported'
+        )
+        parser.add_argument(
+            '--zip',
+            action='store_true',
+            help='Package the Windows Flutter release bundle as a zip'
         )
     parser.add_argument(
         "--package",
@@ -273,9 +399,12 @@ def external_resources(flutter, args, res_dir):
 
 def get_features(args):
     features = ['inline'] if not args.flutter else []
+    windows_arm64 = windows and args.target == 'aarch64-pc-windows-msvc'
     if args.hwcodec:
         features.append('hwcodec')
-    if args.vram:
+    if args.vram and windows_arm64:
+        print('Skip vram: Windows arm64 build uses hwcodec Media Foundation instead of the current VRAM path.')
+    elif args.vram:
         features.append('vram')
     if args.flutter:
         features.append('flutter')
@@ -431,17 +560,28 @@ def build_flutter_arch_manjaro(version, features):
     system2('HBB=`pwd`/.. FLUTTER=1 makepkg -f')
 
 
-def build_flutter_windows(version, features, skip_portable_pack):
+def build_flutter_windows(version, features, skip_portable_pack, target, zip_bundle):
     if not skip_cargo:
-        system2(f'cargo build --locked --features {features} --lib --release')
-        if not os.path.exists("target/release/librustdesk.dll"):
+        system2(f'cargo{cargo_config_args(target)} build --locked --features {features} --lib --release{rust_target_args(target)}')
+        if not os.path.exists(f"{rust_release_dir(target)}/librustdesk.dll"):
             print("cargo build failed, please check rust source code.")
             exit(-1)
     os.chdir('flutter')
+    target_platform = windows_flutter_target_platform(target)
+    if target:
+        os.environ['RUSTDESK_RUST_TARGET'] = target
+    else:
+        os.environ.pop('RUSTDESK_RUST_TARGET', None)
+    if target_platform:
+        os.environ['FLUTTER_WINDOWS_TARGET_PLATFORM'] = target_platform
+    else:
+        os.environ.pop('FLUTTER_WINDOWS_TARGET_PLATFORM', None)
     system2('flutter build windows --release')
     os.chdir('..')
-    shutil.copy2('target/release/deps/dylib_virtual_display.dll',
+    shutil.copy2(f'{rust_release_dir(target)}/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
+    if zip_bundle:
+        zip_windows_flutter_bundle(version, target)
     if skip_portable_pack:
         return
     os.chdir('libs/portable')
@@ -463,9 +603,13 @@ def build_flutter_windows(version, features, skip_portable_pack):
 
 
 def main():
-    global skip_cargo
+    global exe_path, flutter_build_dir, flutter_build_dir_2, skip_cargo
     parser = make_parser()
     args = parser.parse_args()
+    if windows:
+        flutter_build_dir = windows_flutter_build_dir(args.target)
+        flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
+        exe_path = rust_exe_path(args.target)
 
     if os.path.exists(exe_path):
         os.unlink(exe_path)
@@ -489,25 +633,26 @@ def main():
     if windows:
         # build virtual display dynamic library
         os.chdir('libs/virtual_display/dylib')
-        system2('cargo build --locked --release')
+        system2(f'cargo{cargo_config_args(args.target)} build --locked --release{rust_target_args(args.target)}')
         os.chdir('../../..')
 
         if flutter:
-            build_flutter_windows(version, features, args.skip_portable_pack)
+            build_flutter_windows(version, features, args.skip_portable_pack, args.target, args.zip)
             return
-        system2('cargo build --locked --release --features ' + features)
+        release_dir = rust_release_dir(args.target)
+        system2('cargo' + cargo_config_args(args.target) + ' build --locked --release --features ' + features + rust_target_args(args.target))
         # system2('upx.exe target/release/rustdesk.exe')
-        system2('mv target/release/rustdesk.exe target/release/RustDesk.exe')
+        system2(f'mv {release_dir}/rustdesk.exe {release_dir}/RustDesk.exe')
         pa = os.environ.get('P')
         if pa:
             # https://certera.com/kb/tutorial-guide-for-safenet-authentication-client-for-code-signing/
             system2(
                 f'signtool sign /a /v /p {pa} /debug /f .\\cert.pfx /t http://timestamp.digicert.com  '
-                'target\\release\\rustdesk.exe')
+                f'{release_dir}\\rustdesk.exe')
         else:
             print('Not signed')
         system2(
-            f'cp -rf target/release/RustDesk.exe {res_dir}')
+            f'cp -rf {release_dir}/RustDesk.exe {res_dir}')
         os.chdir('libs/portable')
         system2('pip3 install -r requirements.txt')
         system2(

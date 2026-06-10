@@ -33,6 +33,7 @@ use crate::{
 use hbb_common::{
     anyhow::anyhow,
     config,
+    message_proto::CodecRuntimeStatus,
     tokio::sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex as TokioMutex,
@@ -54,13 +55,14 @@ use scrap::{
 #[cfg(windows)]
 use std::sync::Once;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::ErrorKind::WouldBlock,
     ops::{Deref, DerefMut},
     time::{self, Duration, Instant},
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+const MAX_ENCODER_PENDING_FRAMES: usize = 90;
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -74,6 +76,7 @@ lazy_static::lazy_static! {
     //   Because web client does not send the display index in message `VideoReceived`.
     // 2. The client is closing.
     static ref DISPLAY_CONN_IDS: Arc<Mutex<HashMap<usize, HashSet<i32>>>> = Default::default();
+    static ref ENCODING_RUNTIME_STATUS: Arc<Mutex<HashMap<usize, CodecRuntimeStatus>>> = Default::default();
     pub static ref VIDEO_QOS: Arc<Mutex<VideoQoS>> = Default::default();
     pub static ref IS_UAC_RUNNING: Arc<Mutex<bool>> = Default::default();
     pub static ref IS_FOREGROUND_WINDOW_ELEVATED: Arc<Mutex<bool>> = Default::default();
@@ -113,6 +116,50 @@ pub fn notify_video_frame_fetched_by_conn_id(conn_id: i32, frame_tm: Option<Inst
         if let Some(notifier) = notifiers.get(&display_idx) {
             notifier.0.send((conn_id, frame_tm)).ok();
         }
+    }
+}
+
+fn set_encoding_runtime_status(display_idx: usize, is_hardware: bool) {
+    ENCODING_RUNTIME_STATUS.lock().unwrap().insert(
+        display_idx,
+        if is_hardware {
+            CodecRuntimeStatus::CodecRuntimeHardware
+        } else {
+            CodecRuntimeStatus::CodecRuntimeSoftware
+        },
+    );
+}
+
+pub fn encoding_runtime_status(conn_id: i32) -> CodecRuntimeStatus {
+    let statuses = ENCODING_RUNTIME_STATUS.lock().unwrap();
+    let display_conn_ids = DISPLAY_CONN_IDS.lock().unwrap();
+    let mut has_hardware = false;
+    let mut has_software = false;
+
+    for (display_idx, conn_ids) in display_conn_ids.iter() {
+        if !conn_ids.contains(&conn_id) {
+            continue;
+        }
+        match statuses
+            .get(display_idx)
+            .copied()
+            .unwrap_or(CodecRuntimeStatus::CodecRuntimeUnknown)
+        {
+            CodecRuntimeStatus::CodecRuntimeHardware => has_hardware = true,
+            CodecRuntimeStatus::CodecRuntimeSoftware => has_software = true,
+            CodecRuntimeStatus::CodecRuntimeMixed => {
+                has_hardware = true;
+                has_software = true;
+            }
+            CodecRuntimeStatus::CodecRuntimeUnknown => {}
+        }
+    }
+
+    match (has_hardware, has_software) {
+        (true, true) => CodecRuntimeStatus::CodecRuntimeMixed,
+        (true, false) => CodecRuntimeStatus::CodecRuntimeHardware,
+        (false, true) => CodecRuntimeStatus::CodecRuntimeSoftware,
+        _ => CodecRuntimeStatus::CodecRuntimeUnknown,
     }
 }
 
@@ -618,6 +665,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
+    set_encoding_runtime_status(display_idx, encoder.is_hardware());
     VIDEO_QOS.lock().unwrap().store_bitrate(encoder.bitrate());
     VIDEO_QOS
         .lock()
@@ -919,6 +967,10 @@ impl Drop for Raii {
         Encoder::update(scrap::codec::EncodingUpdate::Check);
         VIDEO_QOS.lock().unwrap().remove_display(&self.name);
         DISPLAY_CONN_IDS.lock().unwrap().remove(&self.display_idx);
+        ENCODING_RUNTIME_STATUS
+            .lock()
+            .unwrap()
+            .remove(&self.display_idx);
     }
 }
 
@@ -1164,7 +1216,22 @@ fn handle_one_frame(
             send_conn_ids = sp.send_video_frame(msg);
         }
         Err(e) => {
-            *encode_fail_counter += 1;
+            if e.to_string().as_str() == scrap::codec::ENCODE_PENDING {
+                *encode_fail_counter += 1;
+                log::debug!("encoder output pending, times: {}", *encode_fail_counter);
+                if *encode_fail_counter < MAX_ENCODER_PENDING_FRAMES {
+                    return Ok(send_conn_ids);
+                }
+                *encode_fail_counter = 0;
+                if encoder.is_hardware() {
+                    encoder.disable();
+                    log::error!("switch due to encoder output pending timeout");
+                    bail!("SWITCH");
+                }
+                return Ok(send_conn_ids);
+            } else {
+                *encode_fail_counter += 1;
+            }
             // Encoding errors are not frequent except on Android
             if !cfg!(target_os = "android") {
                 log::error!("encode fail: {e:?}, times: {}", *encode_fail_counter,);

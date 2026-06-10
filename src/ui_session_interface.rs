@@ -1885,6 +1885,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),
                 target_bitrate: Some(t.target_bitrate as _),
+                encoding_runtime_status: Some(t.encoding_runtime_status.enum_value_or_default()),
                 ..Default::default()
             });
             handle_test_delay(t, peer).await;

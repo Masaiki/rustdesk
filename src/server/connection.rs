@@ -1035,6 +1035,7 @@ impl Connection {
                         msg_out.set_test_delay(TestDelay{
                             last_delay: conn.network_delay,
                             target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
+                            encoding_runtime_status: video_service::encoding_runtime_status(id).into(),
                             ..Default::default()
                         });
                         conn.send(msg_out.into()).await;

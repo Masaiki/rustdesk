@@ -4,8 +4,8 @@ use crate::clipboard::{update_clipboard, ClipboardSide};
 use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERVER};
 use crate::{
     client::{
-        self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
-        QualityStatus, MILLI1, SEC30,
+        self, codec_runtime_status_from_iter, new_voice_call_request, Client, Data, Interface,
+        MediaData, MediaSender, QualityStatus, MILLI1, SEC30,
     },
     common::get_default_sound_input,
     ui_session_interface::{InvokeUiSession, Session},
@@ -76,6 +76,7 @@ pub struct Remote<T: InvokeUiSession> {
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
     chroma: Arc<RwLock<Option<Chroma>>>,
+    decoding_runtime_status: Arc<RwLock<HashMap<usize, CodecRuntimeStatus>>>,
     last_record_state: bool,
     sent_close_reason: bool,
 }
@@ -125,6 +126,7 @@ impl<T: InvokeUiSession> Remote<T> {
             peer_info: Default::default(),
             video_threads: Default::default(),
             chroma: Default::default(),
+            decoding_runtime_status: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
         }
@@ -313,6 +315,13 @@ impl<T: InvokeUiSession> Remote<T> {
                                 fps,
                                 chroma,
                                 codec_format,
+                                decoding_runtime_status: Some(codec_runtime_status_from_iter(
+                                    self.decoding_runtime_status
+                                        .read()
+                                        .unwrap()
+                                        .values()
+                                        .copied(),
+                                )),
                                 ..Default::default()
                             });
                         }
@@ -2401,6 +2410,7 @@ impl<T: InvokeUiSession> Remote<T> {
             video_queue,
             decode_fps,
             self.chroma.clone(),
+            self.decoding_runtime_status.clone(),
             discard_queue,
             move |display: usize,
                   data: &mut scrap::ImageRgb,
