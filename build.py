@@ -550,9 +550,7 @@ def build_flutter_dmg(version, features, target):
         system2(f'cp {release_dir}/liblibrustdesk.dylib target/release/liblibrustdesk.dylib')
     system2(f'cp {release_dir}/liblibrustdesk.dylib {release_dir}/librustdesk.dylib')
     os.chdir('flutter')
-    target_arch = macos_flutter_arch(target)
-    flutter_arch_args = f' --target-platform darwin-{target_arch}' if target_arch else ''
-    system2(f'flutter build macos --release{flutter_arch_args}')
+    system2('flutter build macos --release')
     system2(f'cp -rf ../{release_dir}/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/')
     '''
     system2(

@@ -15,7 +15,8 @@
     },
     {
       "name": "vcpkg-pkgconfig-get-modules",
-      "host": true
+      "host": true,
+      "platform": "!(windows & arm64)"
     }
   ],
   "default-features": [
