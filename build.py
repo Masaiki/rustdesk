@@ -125,6 +125,54 @@ lib = "{cargo_path(lib_dir)}"
     return str(config_path)
 
 
+def configure_windows_arm64_vcpkg_env(target):
+    if target != 'aarch64-pc-windows-msvc':
+        return None
+
+    installed_root = vcpkg_installed_root()
+    if installed_root is None:
+        sys.stderr.write('VCPKG_ROOT or VCPKG_INSTALLED_ROOT is required for Windows arm64 builds.\n')
+        sys.exit(-1)
+
+    triplet_root = installed_root / 'arm64-windows-static'
+    source_include = triplet_root / 'include' / 'opus'
+    source_lib = triplet_root / 'lib' / 'opus.lib'
+    missing = [p for p in (source_include, source_lib) if not p.exists()]
+    if missing:
+        sys.stderr.write('Missing Windows arm64 opus files:\n')
+        for path in missing:
+            sys.stderr.write(f'  {path}\n')
+        sys.stderr.write('Install opus with vcpkg for triplet arm64-windows-static.\n')
+        sys.exit(-1)
+
+    compat_root = Path('target') / 'vcpkg-arm64-magnum-opus'
+    compat_triplet = compat_root / 'installed' / 'x64-windows-static'
+    compat_include = compat_triplet / 'include' / 'opus'
+    compat_lib = compat_triplet / 'lib'
+    compat_lib.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_include, compat_include, dirs_exist_ok=True)
+    shutil.copy2(source_lib, compat_lib / 'opus.lib')
+
+    previous = {
+        'VCPKG_ROOT': os.environ.get('VCPKG_ROOT'),
+        'VCPKG_INSTALLED_ROOT': os.environ.get('VCPKG_INSTALLED_ROOT'),
+    }
+    os.environ['VCPKG_INSTALLED_ROOT'] = str(installed_root.resolve())
+    os.environ['VCPKG_ROOT'] = str(compat_root.resolve())
+    print(f'Using Windows arm64 vcpkg compatibility root for magnum-opus: {os.environ["VCPKG_ROOT"]}')
+    return previous
+
+
+def restore_env(previous):
+    if previous is None:
+        return
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 def cargo_config_args(target):
     config_path = write_windows_arm64_cargo_config(target)
     return f' --config "{config_path}"' if config_path else ''
@@ -572,8 +620,10 @@ def build_flutter_arch_manjaro(version, features):
 
 
 def build_flutter_windows(version, features, skip_portable_pack, target, zip_bundle):
+    previous_vcpkg_env = configure_windows_arm64_vcpkg_env(target)
     if not skip_cargo:
         system2(f'cargo{cargo_config_args(target)} build --locked --features {features} --lib --release{rust_target_args(target)}')
+        restore_env(previous_vcpkg_env)
         if not os.path.exists(f"{rust_release_dir(target)}/librustdesk.dll"):
             print("cargo build failed, please check rust source code.")
             exit(-1)
