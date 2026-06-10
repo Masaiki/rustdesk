@@ -586,7 +586,22 @@ endif()
 vcpkg_fixup_pkgconfig()
 
 # Handle dependencies
-x_vcpkg_pkgconfig_get_modules(PREFIX FFMPEG_PKGCONFIG MODULES ${FFMPEG_PKGCONFIG_MODULES} LIBS)
+if(NOT COMMAND x_vcpkg_pkgconfig_get_modules)
+    set(FFMPEG_PKGCONFIG_GET_MODULES_CONFIG "${CURRENT_HOST_INSTALLED_DIR}/share/vcpkg-pkgconfig-get-modules/vcpkg-port-config.cmake")
+    if(EXISTS "${FFMPEG_PKGCONFIG_GET_MODULES_CONFIG}")
+        include("${FFMPEG_PKGCONFIG_GET_MODULES_CONFIG}")
+    endif()
+endif()
+
+if(COMMAND x_vcpkg_pkgconfig_get_modules)
+    x_vcpkg_pkgconfig_get_modules(PREFIX FFMPEG_PKGCONFIG MODULES ${FFMPEG_PKGCONFIG_MODULES} LIBS)
+elseif(VCPKG_TARGET_IS_WINDOWS AND VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    message(WARNING "vcpkg-pkgconfig-get-modules is unavailable; skipping FFmpeg pkg-config dependency extraction for Windows ARM64.")
+    set(FFMPEG_PKGCONFIG_LIBS_RELEASE "")
+    set(FFMPEG_PKGCONFIG_LIBS_DEBUG "")
+else()
+    message(FATAL_ERROR "vcpkg-pkgconfig-get-modules is required to extract FFmpeg pkg-config dependencies.")
+endif()
 
 function(append_dependencies_from_libs out)
     cmake_parse_arguments(PARSE_ARGV 1 "arg" "" "LIBS" "")
