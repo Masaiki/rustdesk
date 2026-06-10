@@ -60,6 +60,17 @@ def windows_flutter_build_dir(target):
     return 'build/windows/x64/runner/Release/'
 
 
+def resolve_windows_flutter_build_dir(target):
+    preferred = Path('flutter') / windows_flutter_build_dir(target)
+    fallback = Path('flutter') / 'build/windows/x64/runner/Release/'
+    if (preferred / 'rustdesk.exe').exists():
+        return windows_flutter_build_dir(target)
+    if target == 'aarch64-pc-windows-msvc' and (fallback / 'rustdesk.exe').exists():
+        print(f'Flutter produced Windows arm64 build under fallback directory: {fallback}')
+        return 'build/windows/x64/runner/Release/'
+    return windows_flutter_build_dir(target)
+
+
 def cargo_path(path):
     return Path(path).as_posix()
 
@@ -620,6 +631,7 @@ def build_flutter_arch_manjaro(version, features):
 
 
 def build_flutter_windows(version, features, skip_portable_pack, target, zip_bundle):
+    global flutter_build_dir, flutter_build_dir_2
     previous_vcpkg_env = configure_windows_arm64_vcpkg_env(target)
     if not skip_cargo:
         system2(f'cargo{cargo_config_args(target)} build --locked --features {features} --lib --release{rust_target_args(target)}')
@@ -639,6 +651,8 @@ def build_flutter_windows(version, features, skip_portable_pack, target, zip_bun
         os.environ.pop('FLUTTER_WINDOWS_TARGET_PLATFORM', None)
     system2('flutter build windows --release')
     os.chdir('..')
+    flutter_build_dir = resolve_windows_flutter_build_dir(target)
+    flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
     shutil.copy2(f'{rust_release_dir(target)}/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
     if zip_bundle:

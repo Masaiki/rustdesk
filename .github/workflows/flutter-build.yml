@@ -177,7 +177,11 @@ jobs:
           # Windows: build RustDesk
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack --zip --target ${{ matrix.job.target }}
           if ("${{ matrix.job.target }}" -eq "aarch64-pc-windows-msvc") {
-            Move-Item -Force ./flutter/build/windows/arm64/runner/Release ./rustdesk
+            if (Test-Path ./flutter/build/windows/arm64/runner/Release/rustdesk.exe) {
+              Move-Item -Force ./flutter/build/windows/arm64/runner/Release ./rustdesk
+            } else {
+              Move-Item -Force ./flutter/build/windows/x64/runner/Release ./rustdesk
+            }
           } else {
             Move-Item -Force ./flutter/build/windows/x64/runner/Release ./rustdesk
           }
