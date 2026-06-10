@@ -146,11 +146,12 @@ def configure_windows_arm64_vcpkg_env(target):
         sys.exit(-1)
 
     compat_root = Path('target') / 'vcpkg-arm64-magnum-opus'
-    compat_triplet = compat_root / 'installed' / 'x64-windows-static'
     shutil.rmtree(compat_root, ignore_errors=True)
-    (compat_triplet / 'include').mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_include, compat_triplet / 'include', dirs_exist_ok=True)
-    shutil.copytree(source_lib, compat_triplet / 'lib', dirs_exist_ok=True)
+    for compat_triplet_name in ('x64-windows-static', 'arm64-windows-static'):
+        compat_triplet = compat_root / 'installed' / compat_triplet_name
+        (compat_triplet / 'include').mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_include, compat_triplet / 'include', dirs_exist_ok=True)
+        shutil.copytree(source_lib, compat_triplet / 'lib', dirs_exist_ok=True)
 
     previous = {
         'VCPKG_ROOT': os.environ.get('VCPKG_ROOT'),
